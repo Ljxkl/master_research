@@ -1,9 +1,0 @@
-dem を/home/jmrsl/research/.state/sbas_pairs.jsonを参考にダウンロードするスクリプトをつくる
-例
-dem.py -a stitch \
--b 35 36 140 141 \
--s 1 \
--r \
--u https://step.esa.int/auxdata/dem/SRTMGL1/
-
-aoiの場所のswothの1,2,3を場所によっては絞ることを考えても良いかも

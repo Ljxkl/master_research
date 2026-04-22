@@ -1,0 +1,18 @@
+# s1_aoi_grouper.py の設定
+aoi_csv: aoi.csv           # リポジトリルートからの相対パス (cwd = master_research/ で実行)
+
+# Sentinel-1 シーン検索条件
+date_start: "2024-01-01"
+date_end: "2024-12-31"
+orbit_direction: DESCENDING  # ASCENDING または DESCENDING
+platform: A             # A / B / C / all、またはリスト (例: [A, C])
+
+# グルーピング条件
+overlap_threshold: 1.0      # 0.0~1.0 (1.0 = 100% 一致)
+min_common_scenes: 1
+max_scenes_per_group: 3  # グループあたりの最大シーン数 (null = 無制限)
+
+# 出力
+dry_run: true
+result_json: null           # null なら <aoi_csv 親>/.state/aoi_grouping_result.json
+output_dir: null            # グループ別 YAML 設定を書き出すディレクトリ (null = スキップ)

@@ -10,9 +10,54 @@ Sentinel-1シーン範囲ベースのAOIグループ化ツール
 import pandas as pd
 import json
 from pathlib import Path
-from typing import List, Dict, Set, Tuple, Optional
+from typing import List, Dict, Set, Optional, Iterable
 from datetime import datetime
 import asf_search as asf
+from shapely.geometry import shape, box
+
+
+_PLATFORM_ALIASES = {
+    'A': 'Sentinel-1A', 'a': 'Sentinel-1A', 'S1A': 'Sentinel-1A',
+    'B': 'Sentinel-1B', 'b': 'Sentinel-1B', 'S1B': 'Sentinel-1B',
+    'C': 'Sentinel-1C', 'c': 'Sentinel-1C', 'S1C': 'Sentinel-1C',
+}
+_ALL_PLATFORMS = ['Sentinel-1A', 'Sentinel-1B', 'Sentinel-1C']
+
+
+def _normalize_platform(platform) -> List[str]:
+    """'A' / 'all' / ['A','C'] 等を asf_search の platform 値リストに変換"""
+    if platform is None:
+        return _ALL_PLATFORMS
+    if isinstance(platform, str):
+        if platform.lower() == 'all':
+            return _ALL_PLATFORMS
+        return [_PLATFORM_ALIASES.get(platform, platform)]
+    if isinstance(platform, Iterable):
+        resolved = []
+        for p in platform:
+            if isinstance(p, str) and p.lower() == 'all':
+                return _ALL_PLATFORMS
+            resolved.append(_PLATFORM_ALIASES.get(p, p))
+        return resolved
+    raise ValueError(f"platform の形式が不正: {platform!r}")
+
+
+def _extract_scene_date(scene_id: str) -> str:
+    """S1 シーン名から取得日 (YYYYMMDD) を抽出。失敗時は空文字。"""
+    for part in scene_id.split('_'):
+        if len(part) >= 15 and part[8:9] == 'T' and part[:8].isdigit():
+            return part[:8]
+    return ''
+
+
+def _thin_scenes(scene_ids: Iterable[str], max_count: Optional[int]) -> List[str]:
+    """日付順で先頭から max_count 枚を取る (S1A の 12日周期を活用)"""
+    ids = sorted(scene_ids, key=lambda s: (_extract_scene_date(s), s))
+    if max_count is None:
+        return ids
+    if max_count <= 0:
+        return []
+    return ids[:max_count]
 
 
 class S1SceneBasedGrouper:
@@ -30,23 +75,26 @@ class S1SceneBasedGrouper:
         self.min_common_scenes = min_common_scenes
         self.groups = []
     
-    def search_scenes_for_aoi(self, bbox, date_start, date_end, 
-                               orbit_direction='ASCENDING'):
+    def search_scenes_for_aoi(self, bbox, date_start, date_end,
+                               orbit_direction='ASCENDING',
+                               platforms: Optional[List[str]] = None):
         """
-        AOIに対してSentinel-1 SLCシーンを検索
-        
+        AOIを **完全に含む** Sentinel-1 SLC シーンのみ返す。
+
         Args:
             bbox: [W, S, E, N] 形式のバウンディングボックス
             date_start: 検索開始日 (YYYY-MM-DD)
             date_end: 検索終了日 (YYYY-MM-DD)
             orbit_direction: 'ASCENDING' or 'DESCENDING'
-        
-        戻り値: シーンID のセット
+            platforms: 'Sentinel-1A' 等のリスト。None なら全機
+
+        戻り値: シーンID のセット (AOI を包含するもののみ)
         """
         try:
             wkt = self._bbox_to_wkt(bbox)
-            
-            results = asf.geo_search(
+            aoi_poly = box(bbox[0], bbox[1], bbox[2], bbox[3])
+
+            kwargs = dict(
                 dataset=asf.DATASET.SENTINEL1,
                 intersectsWith=wkt,
                 start=f"{date_start}T00:00:00Z",
@@ -56,20 +104,29 @@ class S1SceneBasedGrouper:
                 flightDirection=orbit_direction,
                 maxResults=5000,
             )
-            
+            if platforms:
+                kwargs['platform'] = platforms
+            results = asf.geo_search(**kwargs)
+
             scene_ids = set()
+            dropped_partial = 0
             for r in results:
+                scene_poly = shape(r.geometry)
+                if not scene_poly.contains(aoi_poly):
+                    dropped_partial += 1
+                    continue
                 props = r.properties
                 scene_id = (
-                    props.get('sceneName') or 
-                    props.get('fileID') or 
+                    props.get('sceneName') or
+                    props.get('fileID') or
                     props.get('productName')
                 )
                 if scene_id:
                     scene_ids.add(scene_id)
-            
+
+            self._last_dropped_partial = dropped_partial
             return scene_ids
-        
+
         except Exception as e:
             print(f"⚠️  Error searching scenes: {e}")
             return set()
@@ -79,20 +136,24 @@ class S1SceneBasedGrouper:
         w, s, e, n = bbox
         return f"POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))"
     
-    def grouping(self, aoi_df, date_start, date_end, orbit_direction='ASCENDING'):
+    def grouping(self, aoi_df, date_start, date_end, orbit_direction='ASCENDING',
+                 platform=None, max_scenes_per_group: Optional[int] = None):
         """
         全AOIをシーン範囲ベースでグループ化
-        
+
         重複度100%のAOI同士を同じグループに割当てます。
-        
+
         Args:
             aoi_df: AOI の DataFrame (カラム: plant_name, LL_lon, LL_lat, UR_lon, UR_lat)
             date_start: 検索開始日
             date_end: 検索終了日
             orbit_direction: 'ASCENDING' or 'DESCENDING'
-        
+            platform: 'A'/'B'/'C'/'all' またはリスト。None なら全機
+            max_scenes_per_group: グループごとの最大シーン数 (None なら無制限)
+
         戻り値: グループのリスト
         """
+        platforms = _normalize_platform(platform)
         print("="*70)
         print("📡 Sentinel-1 AOI グループ化")
         print("="*70)
@@ -111,107 +172,68 @@ class S1SceneBasedGrouper:
             print(f"  [{idx+1:2d}/{len(aoi_df)}] AOI {idx} ({plant_name})", end=' ... ')
             
             scenes = self.search_scenes_for_aoi(
-                bbox, date_start, date_end, orbit_direction
+                bbox, date_start, date_end, orbit_direction, platforms
             )
-            
+            dropped = getattr(self, '_last_dropped_partial', 0)
+
             aoi_scenes[idx] = scenes
             aoi_metadata[idx] = {
                 'plant_name': plant_name,
                 'bbox': bbox,
                 'scene_count': len(scenes)
             }
-            
-            print(f"✓ {len(scenes)} シーン")
+
+            extra = f" (部分一致 {dropped} 枚除外)" if dropped else ""
+            warn = "  ⚠️ 候補0" if len(scenes) == 0 else ""
+            print(f"✓ {len(scenes)} シーン{extra}{warn}")
         
         print(f"\n✓ シーン検索完了\n")
         
-        # ステップ2: AOI間のシーン重複度を計算
-        print("📊 ステップ2: AOI間の重複度を計算中...")
+        # ステップ2: 候補シーン集合でハッシュグルーピング
+        print("📊 ステップ2: 候補シーン集合でハッシュグルーピング...")
         print("-"*70)
-        
-        # Union-Find のような動的グルーピング
-        parent = list(range(len(aoi_df)))
-        
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])
-            return parent[x]
-        
-        def union(x, y):
-            px, py = find(x), find(y)
-            if px != py:
-                parent[px] = py
-        
-        # すべてのAOIペアを比較
-        merge_count = 0
+
+        from collections import defaultdict
+        buckets: Dict[frozenset, List[int]] = defaultdict(list)
         for i in range(len(aoi_df)):
-            for j in range(i + 1, len(aoi_df)):
-                scenes_i = aoi_scenes[i]
-                scenes_j = aoi_scenes[j]
-                
-                # 共通シーン数
-                common = len(scenes_i & scenes_j)
-                
-                # 重複度を計算
-                if len(scenes_i) == 0 or len(scenes_j) == 0:
-                    overlap = 0.0
-                else:
-                    # シーン数が同じかつ全て共通 = 100%
-                    if len(scenes_i) == len(scenes_j) == common:
-                        overlap = 1.0
-                    else:
-                        # 最小値基準の重複度
-                        min_scenes = min(len(scenes_i), len(scenes_j))
-                        overlap = common / min_scenes if min_scenes > 0 else 0.0
-                
-                plant_i = aoi_metadata[i]['plant_name']
-                plant_j = aoi_metadata[j]['plant_name']
-                
-                # 100% 重複かつ最小シーン数を満たせば同グループ
-                if common >= self.min_common_scenes and overlap >= self.overlap_threshold:
-                    status = "✓ 統合"
-                    union(i, j)
-                    merge_count += 1
-                else:
-                    status = "✗ 分離"
-                
-                print(f"  {status}  {plant_i:15s} ↔ {plant_j:15s}  "
-                      f"重複度={overlap:5.1%}  共通={common:3d}/{min(len(scenes_i), len(scenes_j)):3d}")
-        
-        print(f"\n✓ 重複度計算完了 ({merge_count} ペアが統合)\n")
-        
-        # ステップ3: グループを確定
-        print("🔗 ステップ3: グループを確定中...")
-        print("-"*70)
-        
-        groups_dict: Dict[int, List[int]] = {}
-        for i in range(len(aoi_df)):
-            root = find(i)
-            if root not in groups_dict:
-                groups_dict[root] = []
-            groups_dict[root].append(i)
-        
-        # グループオブジェクトを構築
-        for group_id, (root, aoi_indices) in enumerate(sorted(groups_dict.items())):
-            aoi_indices.sort()
-            
-            # グループ内シーンの和集合
-            group_scenes = set()
-            for idx in aoi_indices:
-                group_scenes.update(aoi_scenes[idx])
-            
+            buckets[frozenset(aoi_scenes[i])].append(i)
+
+        empty_aois = buckets.pop(frozenset(), [])
+        if empty_aois:
+            print(f"  ⚠️  候補シーン 0 の AOI が {len(empty_aois)} 個: グループ化対象外")
+            for i in empty_aois:
+                print(f"     - AOI {i} ({aoi_metadata[i]['plant_name']})")
+
+        print(f"  有効グループ数: {len(buckets)}\n")
+
+        # グループオブジェクトを構築 (候補数が多い順に安定 ID 付与)
+        sorted_groups = sorted(
+            buckets.items(),
+            key=lambda kv: (-len(kv[0]), kv[1][0])  # scene数 desc、tie は最小 AOI index
+        )
+        for group_id, (scene_set, aoi_indices) in enumerate(sorted_groups):
+            aoi_indices = sorted(aoi_indices)
+
+            # bucket 内の AOI は同一の候補集合を持つ
+            group_scenes = set(scene_set)
+            full_count = len(group_scenes)
+            scene_ids = _thin_scenes(group_scenes, max_scenes_per_group)
+            thinned = max_scenes_per_group is not None and full_count > len(scene_ids)
+
             # グループを包含するBBox を計算
             group_bbox = self._compute_group_bbox(aoi_df, aoi_indices)
-            
+
             plant_names = [aoi_metadata[i]['plant_name'] for i in aoi_indices]
-            
+
             group_obj = {
                 'group_id': group_id,
                 'aoi_indices': aoi_indices,
                 'plant_names': plant_names,
                 'bbox': group_bbox,
-                'scene_ids': sorted(list(group_scenes)),
-                'scene_count': len(group_scenes),
+                'scene_ids': scene_ids,
+                'scene_count': len(scene_ids),
+                'scene_count_full': full_count,
+                'thinned': thinned,
             }
             
             self.groups.append(group_obj)
@@ -221,7 +243,10 @@ class S1SceneBasedGrouper:
             print(f"   発電所: {', '.join(plant_names)}")
             print(f"   BBox: W={group_bbox[0]:.6f}, S={group_bbox[1]:.6f}, "
                   f"E={group_bbox[2]:.6f}, N={group_bbox[3]:.6f}")
-            print(f"   シーン数: {len(group_scenes)}")
+            if thinned:
+                print(f"   シーン数: {len(scene_ids)} (全 {full_count} から間引き)")
+            else:
+                print(f"   シーン数: {len(scene_ids)}")
         
         print("\n" + "="*70)
         print(f"✓ グループ化完了: {len(self.groups)} グループ")
@@ -374,123 +399,109 @@ class S1SceneBasedGrouper:
         print(f"\n✓ 設定ファイル生成完了 ({output_dir})\n")
 
 
+def _load_config(config_path: Path) -> dict:
+    import yaml
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f) or {}
+
+    required = ['aoi_csv', 'date_start', 'date_end', 'orbit_direction']
+    missing = [k for k in required if cfg.get(k) is None]
+    if missing:
+        raise ValueError(f"config に必須キーがありません: {missing}")
+
+    cfg.setdefault('overlap_threshold', 1.0)
+    cfg.setdefault('min_common_scenes', 1)
+    cfg.setdefault('max_scenes_per_group', None)
+    cfg.setdefault('platform', None)
+    cfg.setdefault('dry_run', True)
+    cfg.setdefault('result_json', None)
+    cfg.setdefault('output_dir', None)
+
+    if cfg['orbit_direction'] not in ('ASCENDING', 'DESCENDING'):
+        raise ValueError(
+            f"orbit_direction は ASCENDING/DESCENDING: {cfg['orbit_direction']}"
+        )
+
+    cfg['aoi_csv'] = Path(cfg['aoi_csv'])
+    if cfg['result_json'] is not None:
+        cfg['result_json'] = Path(cfg['result_json'])
+    if cfg['output_dir'] is not None:
+        cfg['output_dir'] = Path(cfg['output_dir'])
+
+    return cfg
+
+
 def main():
     """メイン処理"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="Sentinel-1シーン範囲ベースでAOIをグループ化"
     )
     parser.add_argument(
-        '--aoi-csv',
+        'config',
         type=Path,
-        default=Path(__file__).parent.parent / 'aoi.csv',
-        help='AOI CSV ファイルのパス'
+        help='YAML 設定ファイルのパス (例: conf/grouper.yaml)'
     )
-    parser.add_argument(
-        '--date-start',
-        type=str,
-        default='2023-01-01',
-        help='検索開始日 (YYYY-MM-DD)'
-    )
-    parser.add_argument(
-        '--date-end',
-        type=str,
-        default='2025-12-31',
-        help='検索終了日 (YYYY-MM-DD)'
-    )
-    parser.add_argument(
-        '--orbit-direction',
-        type=str,
-        default='ASCENDING',
-        choices=['ASCENDING', 'DESCENDING'],
-        help='オービット方向'
-    )
-    parser.add_argument(
-        '--overlap-threshold',
-        type=float,
-        default=1.0,
-        help='重複度閾値 (0.0~1.0, デフォルト: 1.0 = 100%)'
-    )
-    parser.add_argument(
-        '--output-dir',
-        type=Path,
-        default=None,
-        help='グループ設定ファイルの出力ディレクトリ'
-    )
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='ドライラン: グループ化結果を生成して表示し、JSONで保存する（ダウンロードしない）'
-    )
-    parser.add_argument(
-        '--result-json',
-        type=Path,
-        default=None,
-        help='グループ化結果のJSON出力ファイルパス（指定なしで自動生成）'
-    )
-    
     args = parser.parse_args()
-    
-    if not args.aoi_csv.exists():
-        print(f"❌ AOI CSV ファイルが見つかりません: {args.aoi_csv}")
+
+    if not args.config.exists():
+        print(f"❌ 設定ファイルが見つかりません: {args.config}")
         return 1
-    
-    # AOI CSV を読み込み
-    print(f"📂 AOI CSV を読み込み中: {args.aoi_csv}\n")
 
-    aoi_df = pd.read_csv(args.aoi_csv)
+    cfg = _load_config(args.config)
+    print(f"📂 設定を読み込み: {args.config}\n")
 
+    if not cfg['aoi_csv'].exists():
+        print(f"❌ AOI CSV ファイルが見つかりません: {cfg['aoi_csv']}")
+        return 1
+
+    print(f"📂 AOI CSV を読み込み中: {cfg['aoi_csv']}\n")
+    aoi_df = pd.read_csv(cfg['aoi_csv'])
     print(f"✓ {len(aoi_df)} 個のAOIを読み込みました\n")
-    
-    # グルーパーを初期化
+
     grouper = S1SceneBasedGrouper(
-        scene_overlap_threshold=args.overlap_threshold,
-        min_common_scenes=1
+        scene_overlap_threshold=cfg['overlap_threshold'],
+        min_common_scenes=cfg['min_common_scenes']
     )
-    
-    # グループ化を実行
-    groups = grouper.grouping(
+
+    grouper.grouping(
         aoi_df,
-        date_start=args.date_start,
-        date_end=args.date_end,
-        orbit_direction=args.orbit_direction
+        date_start=cfg['date_start'],
+        date_end=cfg['date_end'],
+        orbit_direction=cfg['orbit_direction'],
+        platform=cfg['platform'],
+        max_scenes_per_group=cfg['max_scenes_per_group'],
     )
-    
-    # Dry-run または Dry-run + 設定出力
-    if args.dry_run:
-        # ドライラン結果を表示
+
+    if cfg['dry_run']:
         grouper.print_dry_run_summary()
-        
-        # JSON結果を保存
-        if args.result_json is None:
-            # デフォルトパスを生成
-            state_dir = args.aoi_csv.parent / '.state'
+
+        result_json = cfg['result_json']
+        if result_json is None:
+            state_dir = cfg['aoi_csv'].parent / '.state'
             state_dir.mkdir(parents=True, exist_ok=True)
-            args.result_json = state_dir / 'aoi_grouping_result.json'
-        
+            result_json = state_dir / 'aoi_grouping_result.json'
+
         result_path = grouper.save_grouping_result(
-            args.result_json,
+            result_json,
             aoi_df,
-            args.date_start,
-            args.date_end,
-            args.orbit_direction
+            cfg['date_start'],
+            cfg['date_end'],
+            cfg['orbit_direction']
         )
-        
         print(f"📄 グループ化結果を保存しました:")
         print(f"   {result_path}\n")
-        
         return 0
-    
-    # オプション: 設定ファイルを出力
-    if args.output_dir:
+
+    if cfg['output_dir']:
         grouper.save_group_configs(
-            args.output_dir,
-            args.date_start,
-            args.date_end,
-            args.orbit_direction
+            cfg['output_dir'],
+            cfg['date_start'],
+            cfg['date_end'],
+            cfg['orbit_direction']
         )
-    
+
     return 0
 
 
