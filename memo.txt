@@ -7,3 +7,9 @@ dem.py -a stitch \
 -u https://step.esa.int/auxdata/dem/SRTMGL1/
 
 aoiの場所のswothの1,2,3を場所によっては絞ることを考えても良いかも
+
+
+(isce2_env) jmrsl@Lisa:~/research$ cat /home/jmrsl/miniconda3/envs/isce2_env/etc/conda/activate.d/isce2_setup.sh
+ISCE_PY_HOME=$(python -c "import isce, os; print(os.path.dirname(isce.__file__))")
+export ISCE_HOME="$ISCE_PY_HOME"
+export PATH=$ISCE_HOME/applications:$ISCE_HOME/bin:$PATH
