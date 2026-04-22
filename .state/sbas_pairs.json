@@ -1,0 +1,82 @@
+{
+  "generated_at": "2026-04-14T08:08:15+00:00",
+  "aoi_bbox": [
+    140.066476,
+    35.371794,
+    140.078943,
+    35.381027
+  ],
+  "date_start": "2023-01-01",
+  "date_end": "2025-12-31",
+  "orbit_direction": "ASCENDING",
+  "s1_download": {
+    "out_dir": "data/",
+    "dry_search_only": false,
+    "show_progress": true,
+    "skip_existing": true,
+    "processes": 8,
+    "max_results": 5000,
+    "platform": "Sentinel-1A",
+    "beam_mode": "IW",
+    "processing_level": "SLC",
+    "aoi_shrink_m": 0
+  },
+  "total_candidates": 3,
+  "groups": {
+    "(39, 'ASCENDING', 'SLC', None)": 3
+  },
+  "chosen_group_key": "(39, 'ASCENDING', 'SLC', None)",
+  "enforce_same_frame": true,
+  "chosen_frame": 112,
+  "chosen_group_frame_counts": {
+    "112": 3
+  },
+  "chosen_group_bbox": [
+    137.800598,
+    34.712704,
+    140.854385,
+    36.569996
+  ],
+  "selected_bbox": [
+    137.800598,
+    34.712704,
+    140.854385,
+    36.569996
+  ],
+  "chosen_group_size_before": 3,
+  "chosen_group_size_after": 3,
+  "selected_count": 3,
+  "selected_ids": [
+    "S1A_IW_SLC__1SDV_20250131T084220_20250131T084244_057686_071C19_CD77",
+    "S1A_IW_SLC__1SDV_20250308T084220_20250308T084244_058211_07315C_EA41",
+    "S1A_IW_SLC__1SDV_20250425T084220_20250425T084245_058911_074D97_8864"
+  ],
+  "pairs": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      2
+    ]
+  ],
+  "pairs_count": 2,
+  "sbas_params": {
+    "choose_group": "max_aoi_overlap",
+    "max_temporal_days": 48,
+    "k_neighbors": 2,
+    "ensure_chain": true,
+    "enforce_same_frame": true,
+    "thin_acquisitions": {
+      "min_repeat_days": null,
+      "max_acquisitions": 10,
+      "keep_ends": true
+    }
+  },
+  "thin_params": {
+    "min_repeat_days": null,
+    "max_acquisitions": 10,
+    "keep_ends": true
+  }
+}

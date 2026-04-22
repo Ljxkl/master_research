@@ -1,0 +1,17 @@
+data
+dem
+ESD
+coarse_coreg
+coarse_interferogram
+coarse_offsets
+fine_coreg
+fine_interferogram
+fine_offsets
+geom_reference
+merged
+output
+reference
+research_env
+secondary
+PICKLE
+Miniconda3-latest-Linux-x86_64.sh
