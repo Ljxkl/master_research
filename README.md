@@ -70,6 +70,7 @@ python tools/s1_download_from_groups.py \
 ```
 
 - `--groups '0,2-4'` でカンマ / 範囲指定
+- `--processes N` で並列 DL (デフォルト 4)
 - `--dry-run` で取得予定のみ表示
 
 ### ③ ISCE2 入力生成
@@ -82,8 +83,9 @@ python tools/s1_isce2_pipeline.py \
   --root data --groups 0
 ```
 
-- 時刻 (HH:MM) が同じシーン同士で連続ペア化 (トラックまたぎ回避)
+- 各グループは同じ (path, frame) なので、日付順で連続ペア化 (track 混在なし)
 - DEM は group bbox を整数度に丸めて `dem.py -a stitch` を呼出、既存なら skip
+- 相対パスで XML を生成 → ディレクトリごと他マシンに移しても動作
 
 ### ④ topsApp 実行
 
@@ -93,6 +95,7 @@ python tools/s1_isce2_run.py --root data --groups 0
 
 - 各 `isce2/<pair>/` を cwd に topsApp.py を実行
 - DEM を pair dir に自動 symlink
+- `--workers N` で並列実行 (デフォルト 2)
 - `--dry-run`, `--pairs`, `--stop-on-error` 等あり
 
 ## 設定ファイル (`conf/grouper.yaml`)
@@ -117,10 +120,10 @@ InSAR 成立スタックが無い AOI は警告付きでスキップ。
 
 ## 典型的なトラブルシュート
 
-- **0 シーン**: `orbit_direction` 反転 (日本では DESC が有利な場合が多い)
-- **topsApp: "No swaths contain any burst overlaps"**: トラック混在。現在はペア生成側で HH:MM 分離済み
-- **GDAL: DEM .vrt not found**: DEM symlink が作られていない (実行スクリプトが自動処理)
-- **dem.py 見つからず**: `conda activate isce2` していない
+- **0 シーン / スタックなし**: `orbit_direction` を反転 (日本では DESC が有利な場合が多い)。また AOI が scene 境界にあると完全包含 scene がなくなる
+- **GDAL: DEM .vrt not found**: DEM symlink が作られていない (`s1_isce2_run.py` が自動処理、古い input-file を再生成)
+- **dem.py / topsApp.py が見つからない**: `conda activate isce2` していない
+- **No space left on device**: `data/group_*/isce2/<pair>/` の中間成果物、不要な `data/group_*/dem/` を削除
 
 ## ライセンス
 
