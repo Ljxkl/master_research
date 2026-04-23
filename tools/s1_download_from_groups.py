@@ -192,8 +192,8 @@ def main():
         required=True,
         help="ダウンロード先ルートディレクトリ (グループごとにサブディレクトリ作成)"
     )
-    parser.add_argument("--processes", type=int, default=1,
-                        help="並列ダウンロード数")
+    parser.add_argument("--processes", type=int, default=4,
+                        help="並列ダウンロード数 (デフォルト 4)")
     parser.add_argument("--skip-existing", action="store_true", default=True,
                         help="既存ファイルがあればスキップ (デフォルト ON)")
     parser.add_argument("--no-skip-existing", dest="skip_existing",

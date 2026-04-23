@@ -7,9 +7,7 @@ date_end: "2024-12-31"
 orbit_direction: DESCENDING  # ASCENDING または DESCENDING
 platform: A             # A / B / C / all、またはリスト (例: [A, C])
 
-# グルーピング条件
-overlap_threshold: 1.0      # 0.0~1.0 (1.0 = 100% 一致)
-min_common_scenes: 1
+# グルーピング条件 (greedy set cover)
 max_scenes_per_group: 3  # グループあたりの最大シーン数 (null = 無制限)
 
 # 出力

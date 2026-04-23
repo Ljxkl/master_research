@@ -16,8 +16,9 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 GROUP_RE = re.compile(r"^group_(\d+)$")
@@ -140,7 +141,9 @@ def main():
     parser.add_argument("--no-skip-existing", dest="skip_existing",
                         action="store_false")
     parser.add_argument("--stop-on-error", action="store_true",
-                        help="失敗したら後続を実行しない")
+                        help="失敗したら後続を実行しない (並列時は実行中のものは続行)")
+    parser.add_argument("--workers", type=int, default=2,
+                        help="並列実行する topsApp.py の数 (デフォルト 2)")
     parser.add_argument("--dry-run", action="store_true",
                         help="実行コマンドを表示のみ")
     args = parser.parse_args()
@@ -162,27 +165,30 @@ def main():
         print("❌ 対象グループなし")
         return 1
 
+    # 対象 (group_dir, pair) の一覧
+    tasks: List[Tuple[Path, str]] = []
+    for g in groups:
+        pairs = _find_pairs(g)
+        if pair_filter:
+            pairs = [p for p in pairs if p in pair_filter]
+        for p in pairs:
+            tasks.append((g, p))
+
     print("=" * 70)
     print("🛰  ISCE2 topsApp 実行")
     print("=" * 70)
     print(f"root : {args.root}")
     print(f"対象 グループ: {[g.name for g in groups]}")
+    print(f"ペア総数: {len(tasks)}  workers: {args.workers}")
     print(f"dry-run: {args.dry_run}  skip-existing: {args.skip_existing}")
     print()
 
     total_ok = 0
     total_fail = 0
 
-    for g in groups:
-        pairs = _find_pairs(g)
-        if pair_filter:
-            pairs = [p for p in pairs if p in pair_filter]
-        print("-" * 70)
-        print(f"{g.name}  ペア数: {len(pairs)}")
-        if not pairs:
-            continue
-
-        for p in pairs:
+    if args.workers <= 1 or len(tasks) <= 1:
+        # シリアル実行
+        for g, p in tasks:
             ok = run_pair(g, p, args.dry_run, args.skip_existing)
             if ok:
                 total_ok += 1
@@ -191,9 +197,32 @@ def main():
                 if args.stop_on_error:
                     print("\n⚠️  stop-on-error: 中断")
                     break
-        else:
-            continue
-        break  # stop-on-error で内側 break から伝搬
+    else:
+        # 並列実行 (ThreadPoolExecutor; subprocess.run が外部プロセス待ちなのでスレッドでOK)
+        stop = False
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(run_pair, g, p, args.dry_run, args.skip_existing): (g, p)
+                for g, p in tasks
+            }
+            for fut in as_completed(futures):
+                g, p = futures[fut]
+                try:
+                    ok = fut.result()
+                except Exception as e:
+                    print(f"    ✗  {g.name}/{p}: 例外 {e}")
+                    ok = False
+                if ok:
+                    total_ok += 1
+                else:
+                    total_fail += 1
+                    if args.stop_on_error and not stop:
+                        stop = True
+                        print("\n⚠️  stop-on-error: 新規 submit なし (実行中は続行)")
+                        # 未開始のものはキャンセル
+                        for f in futures:
+                            if not f.running() and not f.done():
+                                f.cancel()
 
     print()
     print("=" * 70)

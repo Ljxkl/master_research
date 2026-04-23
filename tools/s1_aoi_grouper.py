@@ -1,10 +1,10 @@
 """
-Sentinel-1シーン範囲ベースのAOIグループ化ツール
+Sentinel-1 InSAR 用 AOI グループ化ツール
 
-複数のAOIに対して、Sentinel-1 SLC シーンの取得範囲に基づいて
-自動的にグループ化します。
-
-シーンの重複度が100%のAOI同士を同じグループに割当てます。
+各 AOI について、AOI を完全に包含する SLC 候補を取得し、InSAR キー
+(path_number, flight_direction, frame_number) でスタックに分類する。
+greedy set cover で最小本数のスタックで全 AOI をカバーするように
+グループを決定する。
 """
 
 import pandas as pd
@@ -61,34 +61,21 @@ def _thin_scenes(scene_ids: Iterable[str], max_count: Optional[int]) -> List[str
 
 
 class S1SceneBasedGrouper:
-    """Sentinel-1シーン範囲に基づいてAOIをグループ化"""
-    
-    def __init__(self, 
-                 scene_overlap_threshold: float = 1.0,
-                 min_common_scenes: int = 1):
-        """
-        scene_overlap_threshold: AOIペア間で何%シーンが重なれば同じグループか (0.0~1.0)
-                                 デフォルト: 1.0 (100% 完全一致)
-        min_common_scenes: 最小共通シーン数
-        """
-        self.overlap_threshold = scene_overlap_threshold
-        self.min_common_scenes = min_common_scenes
+    """Sentinel-1 候補 SLC の InSAR キーに基づき、greedy set cover で AOI をグループ化"""
+
+    def __init__(self):
         self.groups = []
     
-    def search_scenes_for_aoi(self, bbox, date_start, date_end,
-                               orbit_direction='ASCENDING',
-                               platforms: Optional[List[str]] = None):
+    def search_insar_stacks_for_aoi(self, bbox, date_start, date_end,
+                                    orbit_direction='ASCENDING',
+                                    platforms: Optional[List[str]] = None):
         """
-        AOIを **完全に含む** Sentinel-1 SLC シーンのみ返す。
+        AOIを完全に含む scene を取得し、InSAR キー ごとにバケット化する。
 
-        Args:
-            bbox: [W, S, E, N] 形式のバウンディングボックス
-            date_start: 検索開始日 (YYYY-MM-DD)
-            date_end: 検索終了日 (YYYY-MM-DD)
-            orbit_direction: 'ASCENDING' or 'DESCENDING'
-            platforms: 'Sentinel-1A' 等のリスト。None なら全機
+        InSAR キー = (pathNumber, flightDirection, frameNumber)
+        同キーの scene 群は同じトラック・同じフレームなので InSAR で組合せ可能。
 
-        戻り値: シーンID のセット (AOI を包含するもののみ)
+        戻り値: {key: set(scene_ids)}
         """
         try:
             wkt = self._bbox_to_wkt(bbox)
@@ -108,7 +95,8 @@ class S1SceneBasedGrouper:
                 kwargs['platform'] = platforms
             results = asf.geo_search(**kwargs)
 
-            scene_ids = set()
+            from collections import defaultdict
+            stacks: Dict[tuple, Set[str]] = defaultdict(set)
             dropped_partial = 0
             for r in results:
                 scene_poly = shape(r.geometry)
@@ -121,15 +109,21 @@ class S1SceneBasedGrouper:
                     props.get('fileID') or
                     props.get('productName')
                 )
-                if scene_id:
-                    scene_ids.add(scene_id)
+                if not scene_id:
+                    continue
+                key = (
+                    props.get('pathNumber'),
+                    props.get('flightDirection'),
+                    props.get('frameNumber'),
+                )
+                stacks[key].add(scene_id)
 
             self._last_dropped_partial = dropped_partial
-            return scene_ids
+            return dict(stacks)
 
         except Exception as e:
             print(f"⚠️  Error searching scenes: {e}")
-            return set()
+            return {}
     
     def _bbox_to_wkt(self, bbox):
         """BBox [W, S, E, N] → WKT Polygon"""
@@ -139,9 +133,9 @@ class S1SceneBasedGrouper:
     def grouping(self, aoi_df, date_start, date_end, orbit_direction='ASCENDING',
                  platform=None, max_scenes_per_group: Optional[int] = None):
         """
-        全AOIをシーン範囲ベースでグループ化
-
-        重複度100%のAOI同士を同じグループに割当てます。
+        各 AOI について (pathNumber, flightDirection, frameNumber) ごとに
+        InSAR 可能スタックを列挙し、greedy set cover で全 AOI をカバーする
+        最小本数のスタックを選ぶ。選ばれた各スタックが 1 グループとなる。
 
         Args:
             aoi_df: AOI の DataFrame (カラム: plant_name, LL_lon, LL_lat, UR_lon, UR_lat)
@@ -158,71 +152,96 @@ class S1SceneBasedGrouper:
         print("📡 Sentinel-1 AOI グループ化")
         print("="*70)
         
-        print("\n📡 ステップ1: 各AOIでSentinel-1 SLCシーンを検索中...")
+        print("\n📡 ステップ1: 各AOIで候補 InSAR スタックを検索中...")
         print("-"*70)
-        
-        # ステップ1: 各AOIのシーンを検索
-        aoi_scenes: Dict[int, Set[str]] = {}
+
+        from collections import defaultdict
+
+        # aoi_candidates[idx] = {(pathNumber, flightDir, frame): set(scene_ids), ...}
+        aoi_candidates: Dict[int, Dict[tuple, Set[str]]] = {}
         aoi_metadata = {}
-        
+
         for idx, row in aoi_df.iterrows():
             bbox = [row['LL_lon'], row['LL_lat'], row['UR_lon'], row['UR_lat']]
             plant_name = row['plant_name']
-            
+
             print(f"  [{idx+1:2d}/{len(aoi_df)}] AOI {idx} ({plant_name})", end=' ... ')
-            
-            scenes = self.search_scenes_for_aoi(
+
+            stacks = self.search_insar_stacks_for_aoi(
                 bbox, date_start, date_end, orbit_direction, platforms
             )
             dropped = getattr(self, '_last_dropped_partial', 0)
 
-            aoi_scenes[idx] = scenes
+            # InSAR 成立条件: scene 数 >= 2
+            usable = {k: v for k, v in stacks.items() if len(v) >= 2}
+
+            aoi_candidates[idx] = usable
+            total_scenes = sum(len(v) for v in usable.values())
             aoi_metadata[idx] = {
                 'plant_name': plant_name,
                 'bbox': bbox,
-                'scene_count': len(scenes)
+                'stack_count': len(usable),
+                'total_scenes': total_scenes,
             }
 
             extra = f" (部分一致 {dropped} 枚除外)" if dropped else ""
-            warn = "  ⚠️ 候補0" if len(scenes) == 0 else ""
-            print(f"✓ {len(scenes)} シーン{extra}{warn}")
-        
-        print(f"\n✓ シーン検索完了\n")
-        
-        # ステップ2: 候補シーン集合でハッシュグルーピング
-        print("📊 ステップ2: 候補シーン集合でハッシュグルーピング...")
+            warn = "  ⚠️ スタックなし" if not usable else ""
+            print(f"✓ {len(usable)} スタック / {total_scenes} シーン{extra}{warn}")
+
+        print(f"\n✓ 検索完了\n")
+
+        # ステップ2: スタック→AOI の逆引きを作る
+        print("📊 ステップ2: greedy set cover でグループ決定...")
         print("-"*70)
 
-        from collections import defaultdict
-        buckets: Dict[frozenset, List[int]] = defaultdict(list)
-        for i in range(len(aoi_df)):
-            buckets[frozenset(aoi_scenes[i])].append(i)
+        stack_to_aois: Dict[tuple, Set[int]] = defaultdict(set)
+        stack_to_scenes: Dict[tuple, Set[str]] = {}
+        for idx, stacks in aoi_candidates.items():
+            for key, scenes in stacks.items():
+                stack_to_aois[key].add(idx)
+                # 同 key なら scene 集合は原理的に同じだが union で保守的に
+                if key in stack_to_scenes:
+                    stack_to_scenes[key] = stack_to_scenes[key] | scenes
+                else:
+                    stack_to_scenes[key] = set(scenes)
 
-        empty_aois = buckets.pop(frozenset(), [])
-        if empty_aois:
-            print(f"  ⚠️  候補シーン 0 の AOI が {len(empty_aois)} 個: グループ化対象外")
-            for i in empty_aois:
+        uncovered = set(idx for idx, s in aoi_candidates.items() if s)
+        covered_groups: List[tuple] = []  # [(key, sorted_aoi_indices, scene_ids), ...]
+
+        while uncovered:
+            best_key = None
+            best_count = 0
+            for key, aois in stack_to_aois.items():
+                n = len(aois & uncovered)
+                if n > best_count:
+                    best_count = n
+                    best_key = key
+            if best_key is None or best_count == 0:
+                break
+            covered = stack_to_aois[best_key] & uncovered
+            covered_groups.append((best_key, sorted(covered), stack_to_scenes[best_key]))
+            uncovered -= covered
+
+        no_stack = [idx for idx, s in aoi_candidates.items() if not s]
+        if no_stack:
+            print(f"  ⚠️  InSAR 可能スタックなしの AOI {len(no_stack)} 個:")
+            for i in no_stack:
                 print(f"     - AOI {i} ({aoi_metadata[i]['plant_name']})")
 
-        print(f"  有効グループ数: {len(buckets)}\n")
+        if uncovered:
+            print(f"  ⚠️  set cover で漏れた AOI {len(uncovered)} 個")
 
-        # グループオブジェクトを構築 (候補数が多い順に安定 ID 付与)
-        sorted_groups = sorted(
-            buckets.items(),
-            key=lambda kv: (-len(kv[0]), kv[1][0])  # scene数 desc、tie は最小 AOI index
-        )
-        for group_id, (scene_set, aoi_indices) in enumerate(sorted_groups):
-            aoi_indices = sorted(aoi_indices)
+        print(f"  採用スタック数: {len(covered_groups)}\n")
 
-            # bucket 内の AOI は同一の候補集合を持つ
-            group_scenes = set(scene_set)
-            full_count = len(group_scenes)
-            scene_ids = _thin_scenes(group_scenes, max_scenes_per_group)
+        # グループオブジェクトを構築
+        for group_id, (key, aoi_indices, stack_scenes) in enumerate(covered_groups):
+            path_no, flight_dir, frame_no = key
+
+            full_count = len(stack_scenes)
+            scene_ids = _thin_scenes(stack_scenes, max_scenes_per_group)
             thinned = max_scenes_per_group is not None and full_count > len(scene_ids)
 
-            # グループを包含するBBox を計算
             group_bbox = self._compute_group_bbox(aoi_df, aoi_indices)
-
             plant_names = [aoi_metadata[i]['plant_name'] for i in aoi_indices]
 
             group_obj = {
@@ -234,24 +253,27 @@ class S1SceneBasedGrouper:
                 'scene_count': len(scene_ids),
                 'scene_count_full': full_count,
                 'thinned': thinned,
+                'path_number': path_no,
+                'flight_direction': flight_dir,
+                'frame_number': frame_no,
             }
-            
+
             self.groups.append(group_obj)
-            
-            print(f"\n グループ {group_id}:")
-            print(f"   AOI インデックス: {aoi_indices}")
-            print(f"   発電所: {', '.join(plant_names)}")
+
+            print(f"\n グループ {group_id}  (path={path_no}, dir={flight_dir}, frame={frame_no}):")
+            print(f"   AOI: {len(aoi_indices)} 個")
+            print(f"   発電所: {', '.join(plant_names[:5])}{' ...' if len(plant_names) > 5 else ''}")
             print(f"   BBox: W={group_bbox[0]:.6f}, S={group_bbox[1]:.6f}, "
                   f"E={group_bbox[2]:.6f}, N={group_bbox[3]:.6f}")
             if thinned:
                 print(f"   シーン数: {len(scene_ids)} (全 {full_count} から間引き)")
             else:
                 print(f"   シーン数: {len(scene_ids)}")
-        
+
         print("\n" + "="*70)
         print(f"✓ グループ化完了: {len(self.groups)} グループ")
         print("="*70 + "\n")
-        
+
         return self.groups
     
     def _compute_group_bbox(self, aoi_df, aoi_indices):
@@ -295,6 +317,11 @@ class S1SceneBasedGrouper:
                 'aoi_count': len(group['aoi_indices']),
                 'aoi_indices': group['aoi_indices'],
                 'aoi_names': group['plant_names'],
+                'insar_key': {
+                    'path_number': group.get('path_number'),
+                    'flight_direction': group.get('flight_direction'),
+                    'frame_number': group.get('frame_number'),
+                },
                 'bbox': {
                     'lower_left': [group['bbox'][0], group['bbox'][1]],
                     'upper_right': [group['bbox'][2], group['bbox'][3]]
@@ -310,7 +337,6 @@ class S1SceneBasedGrouper:
                 'date_start': date_start,
                 'date_end': date_end,
                 'orbit_direction': orbit_direction,
-                'overlap_threshold': self.overlap_threshold
             },
             'summary': {
                 'total_aois': len(aoi_df),
@@ -409,8 +435,6 @@ def _load_config(config_path: Path) -> dict:
     if missing:
         raise ValueError(f"config に必須キーがありません: {missing}")
 
-    cfg.setdefault('overlap_threshold', 1.0)
-    cfg.setdefault('min_common_scenes', 1)
     cfg.setdefault('max_scenes_per_group', None)
     cfg.setdefault('platform', None)
     cfg.setdefault('dry_run', True)
@@ -460,10 +484,7 @@ def main():
     aoi_df = pd.read_csv(cfg['aoi_csv'])
     print(f"✓ {len(aoi_df)} 個のAOIを読み込みました\n")
 
-    grouper = S1SceneBasedGrouper(
-        scene_overlap_threshold=cfg['overlap_threshold'],
-        min_common_scenes=cfg['min_common_scenes']
-    )
+    grouper = S1SceneBasedGrouper()
 
     grouper.grouping(
         aoi_df,

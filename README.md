@@ -103,15 +103,17 @@ python tools/s1_isce2_run.py --root data --groups 0
 | `date_start` / `date_end` | 検索期間 |
 | `orbit_direction` | `ASCENDING` / `DESCENDING` |
 | `platform` | `A` / `B` / `C` / `all` / リスト |
-| `overlap_threshold` | 現状は 1.0 固定想定 (アルゴリズムがハッシュ方式) |
 | `max_scenes_per_group` | グループあたり上限 (先頭から 12 日間隔) |
 | `dry_run` | true で JSON サマリ出力のみ |
 
 ## グルーピングの仕様
 
-AOI ごとに ASF から「**AOI を完全に包含する** Sentinel-1 SLC シーン」を取得し、
-候補シーン集合が完全一致する AOI 同士を 1 つのグループにまとめる (O(N) ハッシュ方式)。
-候補が空の AOI はグループ化対象外として警告。
+1. AOI ごとに ASF へ問い合わせ、**AOI を完全に包含する** SLC を抽出
+2. それらを `(path_number, flight_direction, frame_number)` ごとに InSAR 可能スタックへ分類 (scene 数 < 2 のスタックは除外)
+3. 全 AOI を最小本数のスタックでカバーするよう greedy set cover で採用スタックを決定 → 採用 1 スタック = 1 グループ
+4. グループ内 AOI は同じ track + frame なので scene 集合も同一 (共通 DL 可能)
+
+InSAR 成立スタックが無い AOI は警告付きでスキップ。
 
 ## 典型的なトラブルシュート
 
